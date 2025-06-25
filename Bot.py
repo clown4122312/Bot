@@ -8,12 +8,11 @@ from collections import defaultdict
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
-    ApplicationBuilder,
+    Updater,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ContextTypes,
-    filters
+    Filters
 )
 from openai import OpenAI
 
@@ -22,20 +21,14 @@ load_dotenv("KEY.env")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 YOUR_WALLET_ADDRESS = os.getenv("YOUR_WALLET_ADDRESS")
-PORT = int(os.environ.get("PORT", 8443))
-RENDER_DOMAIN = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "your_render_service_name.onrender.com")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 logging.basicConfig(level=logging.INFO)
 ALERTS_FILE = "alerts.json"
 os.makedirs("images", exist_ok=True)
 
+# Lưu cảnh báo đã lặp
 alert_repeat_counter = defaultdict(lambda: defaultdict(int))
-
-PROXY = {
-    'http': 'http://v2-506-403548:OWUVP@14.161.29.217:15506',
-    'https': 'http://v2-506-403548:OWUVP@14.161.29.217:15506'
-}
 
 # ======= JSON Helper =======
 def load_json(file):
@@ -62,11 +55,21 @@ def analyze_chart_image(path):
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "Bạn là chuyên gia phân tích kỹ thuật crypto..."},
-            {"role": "user", "content": [
-                {"type": "text", "text": f"Phân tích biểu đồ (gợi ý coin: {coin_guess})"},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-            ]}
+            {
+                "role": "system",
+                "content": (
+                    "Bạn là chuyên gia phân tích kỹ thuật crypto. "
+                    "Phân tích biểu đồ dưới đây và đoán tên coin nếu có thể. "
+                    "Nhận định xu hướng, hỗ trợ/kháng cự và tín hiệu vào lệnh."
+                )
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"Phân tích biểu đồ (gợi ý coin: {coin_guess})"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+                ]
+            }
         ],
         max_tokens=1000
     )
@@ -75,10 +78,7 @@ def analyze_chart_image(path):
 # ======= Funding Binance Futures =======
 def fetch_funding_rate(symbol="BTC/USDT"):
     try:
-        binance = ccxt.binance({
-            'options': {'defaultType': 'future'},
-            'proxies': PROXY
-        })
+        binance = ccxt.binance({'options': {'defaultType': 'future'}})
         binance.load_markets()
         funding = binance.fetch_funding_rate(symbol)
         return funding.get("fundingRate")
@@ -86,24 +86,22 @@ def fetch_funding_rate(symbol="BTC/USDT"):
         print(f"[ERROR] funding {symbol}: {e}")
         return None
 
-def check_funding(context: ContextTypes.DEFAULT_TYPE):
+def check_funding(context):
     alerts = load_json(ALERTS_FILE)
     bot = context.bot
-    exchange = ccxt.binance({
-        'options': {'defaultType': 'future'},
-        'proxies': PROXY
-    })
+    exchange = ccxt.binance({'options': {'defaultType': 'future'}})
     exchange.load_markets()
 
     for user_id, user_alerts in list(alerts.items()):
         for symbol, alert in list(user_alerts.items()):
             if not isinstance(alert, dict):
                 continue
+
             try:
                 operator = alert.get("operator", ">")
                 threshold = float(alert.get("threshold", 0))
                 funding_data = exchange.fetch_funding_rate(symbol)
-                rate = funding_data.get("fundingRate") * 100
+                rate = funding_data.get("fundingRate") * 100  # chuyển về %
 
                 if rate is None:
                     continue
@@ -120,38 +118,144 @@ def check_funding(context: ContextTypes.DEFAULT_TYPE):
                     count = alert_repeat_counter[user_id][symbol]
                     alert_repeat_counter[user_id][symbol] += 1
 
-                    bot.send_message(chat_id=user_id, text=f"⚠️ Funding {symbol} = {rate:.3f}% {operator} {threshold}%")
+                    bot.send_message(
+                        chat_id=user_id,
+                        text=f"⚠️ Funding {symbol} = {rate:.3f}% {operator} {threshold}%"
+                    )
 
-                    if count >= 1:
+                    if count >= 1:  # Nếu gửi lần 2
                         del alerts[user_id][symbol]
                         if not alerts[user_id]:
                             alerts.pop(user_id)
                         save_json(ALERTS_FILE, alerts)
                         alert_repeat_counter[user_id].pop(symbol, None)
 
-                        bot.send_message(chat_id=user_id, text=f"✅ Đã xoá cảnh báo `{symbol}` sau 2 lần gửi.", parse_mode="Markdown")
+                        bot.send_message(
+                            chat_id=user_id,
+                            text=f"✅ Đã xoá cảnh báo `{symbol}` sau 2 lần gửi.",
+                            parse_mode="Markdown"
+                        )
                 else:
-                    alert_repeat_counter[user_id][symbol] = 0
+                    alert_repeat_counter[user_id][symbol] = 0  # reset nếu ko còn match
             except Exception as e:
                 bot.send_message(chat_id=user_id, text=f"❌ Lỗi funding {symbol}: {e}")
 
-# Các hàm xử lý lệnh (start, donate, setfunding, v.v.) giữ nguyên như cũ
+# ======= Bot Commands =======
+def start(update, context):
+    msg = (
+        "🤖 *Crypto GPT Bot miễn phí!*\n\n"
+        "• 📷 Gửi ảnh biểu đồ để GPT phân tích\n"
+        "• 📈 Cảnh báo funding: `/setfunding BTC > -0.01`\n"
+        "• 📋 Xem cảnh báo: `/funding`\n"
+        "• 💖 Ủng hộ: `/donate`"
+    )
+    update.message.reply_text(msg, parse_mode="Markdown")
 
-# ======= Main dùng Webhook =======
-async def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+def analyze_instruction(update, context):
+    update.message.reply_text("📷 Gửi ảnh biểu đồ bạn muốn GPT phân tích.")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("analyze", analyze_instruction))
-    app.add_handler(CommandHandler("donate", donate))
-    app.add_handler(CommandHandler("setfunding", set_funding))
-    app.add_handler(CommandHandler("funding", funding_menu))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+def donate(update, context):
+    msg = (
+        "🙏 *Ủng hộ phát triển bot*\n\n"
+        f"Ví USDT (BEP20):\n`{YOUR_WALLET_ADDRESS}`\n\n"
+        "Cảm ơn bạn rất nhiều! ❤️"
+    )
+    update.message.reply_text(msg, parse_mode="Markdown")
 
-    app.job_queue.run_repeating(check_funding, interval=300, first=5)
+def handle_photo(update, context):
+    photo = update.message.photo[-1]
+    file = photo.get_file()
+    path = f"images/{photo.file_id}.jpg"
+    file.download(path)
+    update.message.reply_text("🧠 GPT đang phân tích biểu đồ...")
+    try:
+        result = analyze_chart_image(path)
+        update.message.reply_text(result)
+    except Exception as e:
+        update.message.reply_text(f"❌ Lỗi GPT: {e}")
+    finally:
+        os.remove(path)
 
-    await app.bot.set_my_commands([
+def set_funding(update, context):
+    user_id = str(update.effective_user.id)
+    try:
+        if len(context.args) < 3:
+            raise ValueError("Thiếu cú pháp. Dạng đúng: /setfunding BTC > -0.01")
+
+        symbol = context.args[0].upper() + "/USDT"
+        operator = context.args[1]
+        threshold = float(context.args[2])
+
+        if operator not in [">", ">=", "<", "<=", "="]:
+            raise ValueError("Toán tử không hợp lệ. Dùng >, >=, <, <=, =")
+
+        alerts = load_json(ALERTS_FILE)
+        user_alerts = alerts.get(user_id, {})
+
+        if len(user_alerts) >= 8 and symbol not in user_alerts:
+            update.message.reply_text("⚠️ Tối đa 8 coin được theo dõi.")
+            return
+
+        user_alerts[symbol] = {
+            "symbol": symbol,
+            "threshold": threshold,
+            "operator": operator
+        }
+        alerts[user_id] = user_alerts
+        save_json(ALERTS_FILE, alerts)
+
+        update.message.reply_text(
+            f"✅ Đã đặt cảnh báo funding: {symbol} {operator} {threshold}",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        update.message.reply_text(f"❌ Lỗi: {e}\n📌 Dạng đúng: /setfunding BTC > -0.01", parse_mode="Markdown")
+
+def funding_menu(update, context):
+    user_id = str(update.effective_user.id)
+    alerts = load_json(ALERTS_FILE)
+    user_alerts = alerts.get(user_id, {})
+
+    if not user_alerts:
+        update.message.reply_text("📭 Chưa có cảnh báo nào.")
+        return
+
+    lines = ["📊 Danh sách cảnh báo:"]
+    for symbol, alert in user_alerts.items():
+        lines.append(f"• `{symbol}` {alert['operator']} `{alert['threshold']}`")
+    keyboard = [[InlineKeyboardButton("❌ Xoá tất cả", callback_data="delete_all")]]
+    update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+def handle_callback(update, context):
+    query = update.callback_query
+    user_id = str(query.from_user.id)
+    alerts = load_json(ALERTS_FILE)
+
+    if query.data == "delete_all":
+        alerts.pop(user_id, None)
+        save_json(ALERTS_FILE, alerts)
+        query.edit_message_text("✅ Đã xoá toàn bộ cảnh báo.")
+
+# ======= Main =======
+def main():
+    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("analyze", analyze_instruction))
+    dp.add_handler(CommandHandler("donate", donate))
+    dp.add_handler(CommandHandler("setfunding", set_funding))
+    dp.add_handler(CommandHandler("funding", funding_menu))
+    dp.add_handler(CallbackQueryHandler(handle_callback))
+    dp.add_handler(MessageHandler(Filters.photo, handle_photo))
+
+    updater.job_queue.run_repeating(check_funding, interval=300, first=5)
+
+    updater.bot.set_my_commands([
         BotCommand("start", "Giới thiệu bot"),
         BotCommand("analyze", "Phân tích ảnh biểu đồ"),
         BotCommand("setfunding", "Đặt cảnh báo funding"),
@@ -159,16 +263,9 @@ async def main():
         BotCommand("donate", "Ủng hộ bot")
     ])
 
-    await app.start()
-    await app.updater.start_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=TELEGRAM_BOT_TOKEN,
-        webhook_url=f"https://{RENDER_DOMAIN}/{TELEGRAM_BOT_TOKEN}"
-    )
-    print("🤖 Bot đang chạy với webhook...")
-    await app.updater.idle()
+    updater.start_polling()
+    print("🤖 Bot đang chạy...")
+    updater.idle()
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
